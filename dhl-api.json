@@ -1,0 +1,102 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "DHL Processing API",
+    "version": "1.0.0",
+    "description": "API for processing OTM orders with 3500kg consolidation logic"
+  },
+  "servers": [
+    {
+      "url": "https://otm-cloudant-proxy.onrender.com",
+      "description": "Production server"
+    }
+  ],
+  "paths": {
+    "/process-orders": {
+      "post": {
+        "summary": "Process orders with 3500kg logic",
+        "description": "Processes all unprocessed orders from Cloudant, applies 3500kg consolidation logic, and generates DHL labels",
+        "operationId": "processOrders",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "description": "Whether processing was successful"
+                    },
+                    "processed": {
+                      "type": "integer",
+                      "description": "Number of orders processed"
+                    },
+                    "total": {
+                      "type": "integer",
+                      "description": "Total number of orders found"
+                    },
+                    "watson_response": {
+                      "type": "string",
+                      "description": "Human-readable response for Watson Assistant"
+                    },
+                    "results": {
+                      "type": "array",
+                      "description": "Detailed results for each processed order",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "order_id": {
+                            "type": "string"
+                          },
+                          "label_id": {
+                            "type": "string"
+                          },
+                          "weight_kg": {
+                            "type": "number"
+                          },
+                          "cumulative_weight": {
+                            "type": "number"
+                          },
+                          "order_count": {
+                            "type": "integer"
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": ["ACTIVE", "CLOSED"]
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "watson_response": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
