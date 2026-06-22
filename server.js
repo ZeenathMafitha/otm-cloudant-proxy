@@ -226,6 +226,11 @@ async function processOrder(order, token) {
   // Parse OTM order
   const parsedOrder = parseOTMOrder(order);
   
+  // Check if parsing was successful
+  if (!parsedOrder) {
+    throw new Error('Failed to parse order - invalid JSON structure');
+  }
+  
   // Get or create label (3500kg logic)
   const label = await getOrCreateLabel(parsedOrder, token);
   
@@ -248,30 +253,46 @@ async function processOrder(order, token) {
   };
 }
 
-// Parse OTM JSON
+// Parse OTM JSON - FIXED for actual OTM structure
 function parseOTMOrder(order) {
-  const orderData = order.GLogXMLElement || order;
-  const orderRelease = orderData.OrderRelease || {};
-  const shipment = orderRelease.Shipment || {};
-  const shipUnit = shipment.ShipUnit || {};
-  
-  const orderId = orderRelease.OrderReleaseGid?.Gid || order._id;
-  const sourceLocation = orderRelease.SourceLocation?.DomainName || 'UNKNOWN';
-  const destLocation = shipUnit.FinalDestination?.DomainName || 'UNKNOWN';
-  
-  // Convert LB to KG
-  const weightLB = parseFloat(shipUnit.TotalWeight?.WeightValue || 0);
-  const weightKG = weightLB * 0.453592;
-  
-  const deliveryDate = shipUnit.EarlyDeliveryDate || new Date().toISOString().split('T')[0];
-  
-  return {
-    order_id: orderId,
-    source: sourceLocation,
-    destination: destLocation,
-    weight_kg: Math.round(weightKG * 100) / 100,
-    delivery_date: deliveryDate
-  };
+  try {
+    // OTM sends data in transactions.items[0].body
+    const transaction = order.transactions?.items?.[0];
+    const body = transaction?.body;
+    
+    if (!body) {
+      console.error('No transaction body found in order:', order._id);
+      return null;
+    }
+    
+    // Extract order details
+    const orderId = body.orderReleaseGid || body.orderReleaseXid || order._id;
+    const sourceLocation = body.sourceLocationGid || 'UNKNOWN';
+    const destLocation = body.destLocationGid || 'UNKNOWN';
+    
+    // Get weight - it's in LB, convert to KG
+    const weightLB = parseFloat(body.totalWeight?.value || 0);
+    const weightKG = weightLB * 0.453592;
+    
+    // Get delivery date
+    const deliveryDate = body.lateDeliveryDate?.value?.split('T')[0] ||
+                        body.earlyPickupDate?.value?.split('T')[0] ||
+                        new Date().toISOString().split('T')[0];
+    
+    console.log(`✅ Parsed order: ${orderId}, Weight: ${weightLB} LB = ${weightKG.toFixed(2)} KG`);
+    
+    return {
+      order_id: orderId,
+      source: sourceLocation,
+      destination: destLocation,
+      weight_kg: Math.round(weightKG * 100) / 100,
+      weight_lb: Math.round(weightLB * 100) / 100,
+      delivery_date: deliveryDate
+    };
+  } catch (error) {
+    console.error('❌ Error parsing OTM order:', error.message);
+    return null;
+  }
 }
 
 // Get or create label with 3500kg threshold logic
@@ -497,6 +518,69 @@ async function markOrderProcessed(order, token) {
   );
 }
 
+// Dashboard API endpoints - Fix CORS issue
+app.get('/api/labels', async (req, res) => {
+  try {
+    const token = await getIAMToken();
+    const response = await axios.get(
+      `${CLOUDANT_URL}/labels/_all_docs?include_docs=true`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      }
+    );
+    
+    const labels = response.data.rows
+      .map(row => row.doc)
+      .filter(doc => doc.label_id);
+    
+    res.json({ success: true, labels });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/label/:id', async (req, res) => {
+  try {
+    const token = await getIAMToken();
+    const response = await axios.get(
+      `${CLOUDANT_URL}/labels/${req.params.id}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      }
+    );
+    
+    res.json({ success: true, label: response.data });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/orders/pending', async (req, res) => {
+  try {
+    const token = await getIAMToken();
+    const response = await axios.get(
+      `${CLOUDANT_URL}/incoming_orders/_all_docs?include_docs=true`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      }
+    );
+    
+    const pendingOrders = response.data.rows
+      .map(row => row.doc)
+      .filter(doc => !doc._id.startsWith('_design') && !doc.processed);
+    
+    res.json({ success: true, count: pendingOrders.length, orders: pendingOrders });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({
@@ -505,6 +589,9 @@ app.get('/', (req, res) => {
     endpoints: {
       webhook: 'POST /webhook - Receive OTM orders',
       process: 'POST /process-orders - Process orders with 3500kg logic (Watson AI)',
+      labels: 'GET /api/labels - Get all labels (Dashboard API)',
+      label: 'GET /api/label/:id - Get specific label (Dashboard API)',
+      pending: 'GET /api/orders/pending - Get pending orders count',
       health: 'GET /health - Health check',
       test: 'GET /test - Test IAM token'
     }
