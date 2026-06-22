@@ -524,5 +524,3 @@ app.listen(PORT, () => {
   console.log('  GET  /        - Service info');
   console.log('='.repeat(60) + '\n');
 });
-
-// Made with Bob
