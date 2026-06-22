@@ -1,0 +1,24 @@
+{
+  "name": "otm-cloudant-proxy",
+  "version": "1.0.0",
+  "description": "Proxy service for OTM to IBM Cloudant with IAM authentication",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "otm",
+    "cloudant",
+    "proxy",
+    "ibm-cloud"
+  ],
+  "author": "Zeenath Mohamed",
+  "license": "MIT"
+}
