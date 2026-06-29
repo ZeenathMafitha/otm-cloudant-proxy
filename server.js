@@ -638,61 +638,112 @@ app.post('/consolidate-labels', async (req, res) => {
       // Sort by created_at
       routeLabels.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
       
-      const primaryLabel = routeLabels[0];
-      const labelsToMerge = routeLabels.slice(1);
+      console.log(`\n📍 Route: ${route} - Found ${routeLabels.length} labels`);
       
-      let totalWeight = primaryLabel.cumulative_weight_kg;
-      let allOrders = [...primaryLabel.orders];
+      // Process labels respecting 5000kg limit
+      let currentLabel = null;
+      let labelsToDelete = [];
       
-      console.log(`\n📍 Route: ${route}`);
-      console.log(`   Primary: ${primaryLabel.label_id} (${primaryLabel.cumulative_weight_kg}kg)`);
-      
-      for (const label of labelsToMerge) {
-        console.log(`   Merging: ${label.label_id} (${label.cumulative_weight_kg}kg)`);
-        totalWeight += label.cumulative_weight_kg;
-        allOrders = allOrders.concat(label.orders);
+      for (const label of routeLabels) {
+        if (!currentLabel) {
+          // First label becomes the primary
+          currentLabel = label;
+          currentLabel.max_weight_kg = 5000;
+          currentLabel.route = route;
+          console.log(`   🎯 Primary: ${currentLabel.label_id} (${currentLabel.cumulative_weight_kg}kg)`);
+          continue;
+        }
         
-        // Delete merged label
-        await axios.delete(
-          `${CLOUDANT_URL}/labels/${label._id}?rev=${label._rev}`,
+        // Check if we can merge this label into current
+        const newWeight = currentLabel.cumulative_weight_kg + label.cumulative_weight_kg;
+        
+        if (newWeight <= 5000) {
+          // Can merge
+          console.log(`   ➕ Merging: ${label.label_id} (${label.cumulative_weight_kg}kg) → Total: ${newWeight}kg`);
+          currentLabel.orders = currentLabel.orders.concat(label.orders);
+          currentLabel.cumulative_weight_kg = Math.round(newWeight * 100) / 100;
+          currentLabel.order_count = currentLabel.orders.length;
+          labelsToDelete.push(label);
+        } else {
+          // Cannot merge - would exceed 5000kg
+          console.log(`   ⚠️  Cannot merge ${label.label_id} (${label.cumulative_weight_kg}kg) - would exceed 5000kg (${newWeight}kg)`);
+          
+          // Save current label and start new one
+          currentLabel.updated_at = new Date().toISOString();
+          currentLabel.status = currentLabel.cumulative_weight_kg >= 4750 ? 'closed' : 'active';
+          
+          await axios.put(
+            `${CLOUDANT_URL}/labels/${currentLabel._id}`,
+            currentLabel,
+            {
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+              }
+            }
+          );
+          
+          consolidationResults.push({
+            route,
+            label_id: currentLabel.label_id,
+            weight: currentLabel.cumulative_weight_kg,
+            orders: currentLabel.order_count,
+            status: currentLabel.status
+          });
+          
+          console.log(`   ✅ Saved ${currentLabel.label_id}: ${currentLabel.cumulative_weight_kg}kg, ${currentLabel.order_count} orders`);
+          
+          // This label becomes the new primary
+          currentLabel = label;
+          currentLabel.max_weight_kg = 5000;
+          currentLabel.route = route;
+          console.log(`   🎯 New Primary: ${currentLabel.label_id} (${currentLabel.cumulative_weight_kg}kg)`);
+        }
+      }
+      
+      // Save the last current label
+      if (currentLabel) {
+        currentLabel.updated_at = new Date().toISOString();
+        currentLabel.status = currentLabel.cumulative_weight_kg >= 4750 ? 'closed' : 'active';
+        
+        await axios.put(
+          `${CLOUDANT_URL}/labels/${currentLabel._id}`,
+          currentLabel,
           {
             headers: {
-              'Authorization': `Bearer ${token}`
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json'
             }
           }
         );
+        
+        consolidationResults.push({
+          route,
+          label_id: currentLabel.label_id,
+          weight: currentLabel.cumulative_weight_kg,
+          orders: currentLabel.order_count,
+          status: currentLabel.status
+        });
+        
+        console.log(`   ✅ Saved ${currentLabel.label_id}: ${currentLabel.cumulative_weight_kg}kg, ${currentLabel.order_count} orders`);
       }
       
-      // Update primary label
-      primaryLabel.orders = allOrders;
-      primaryLabel.cumulative_weight_kg = Math.round(totalWeight * 100) / 100;
-      primaryLabel.order_count = allOrders.length;
-      primaryLabel.max_weight_kg = 5000;
-      primaryLabel.route = route;
-      primaryLabel.updated_at = new Date().toISOString();
-      primaryLabel.status = totalWeight >= 4750 ? 'closed' : 'active';
-      
-      await axios.put(
-        `${CLOUDANT_URL}/labels/${primaryLabel._id}`,
-        primaryLabel,
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json'
-          }
+      // Delete merged labels
+      for (const label of labelsToDelete) {
+        try {
+          await axios.delete(
+            `${CLOUDANT_URL}/labels/${label._id}?rev=${label._rev}`,
+            {
+              headers: {
+                'Authorization': `Bearer ${token}`
+              }
+            }
+          );
+          console.log(`   🗑️  Deleted ${label.label_id}`);
+        } catch (error) {
+          console.log(`   ❌ Error deleting ${label.label_id}: ${error.message}`);
         }
-      );
-      
-      consolidationResults.push({
-        route,
-        primary_label: primaryLabel.label_id,
-        merged_count: labelsToMerge.length,
-        total_weight: totalWeight,
-        total_orders: allOrders.length,
-        status: primaryLabel.status
-      });
-      
-      console.log(`   ✅ Consolidated into ${primaryLabel.label_id}: ${totalWeight}kg, ${allOrders.length} orders`);
+      }
     }
     
     console.log('='.repeat(60) + '\n');
