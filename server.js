@@ -272,7 +272,7 @@ function parseOTMOrder(order) {
     
     // Get weight - it's in LB, convert to KG
     const weightLB = parseFloat(body.totalWeight?.value || 0);
-    const weightKG = weightLB * 0.453592;
+    const weightKG = weightLB * 0.453592;  // 1 LB = 0.453592 KG
     
     // Get delivery date
     const deliveryDate = body.lateDeliveryDate?.value?.split('T')[0] ||
@@ -306,9 +306,8 @@ async function getOrCreateLabel(order, token) {
       {
         selector: {
           route: route,
-          status: 'ACTIVE'
+          status: 'active'
         },
-        sort: [{ created_at: 'desc' }],
         limit: 1
       },
       {
@@ -319,33 +318,48 @@ async function getOrCreateLabel(order, token) {
       }
     );
     
+    console.log(`🔍 Looking for active label with route: ${route}`);
+    console.log(`📊 Found ${findResponse.data.docs.length} active labels`);
+    
     const existingLabel = findResponse.data.docs[0];
     
-    // Check if we can add to existing label (3500kg threshold)
-    if (existingLabel && (existingLabel.cumulative_weight_kg + order.weight_kg <= 3500)) {
-      // Add to existing label
-      existingLabel.orders.push({
-        order_id: order.order_id,
-        weight_kg: order.weight_kg
-      });
-      existingLabel.cumulative_weight_kg = Math.round((existingLabel.cumulative_weight_kg + order.weight_kg) * 100) / 100;
-      existingLabel.order_count++;
-      existingLabel.updated_at = new Date().toISOString();
+    // Check if we can add to existing label (5000kg threshold)
+    if (existingLabel) {
+      const newWeight = existingLabel.cumulative_weight_kg + order.weight_kg;
+      console.log(`📦 Existing label: ${existingLabel.label_id}, Current: ${existingLabel.cumulative_weight_kg}kg, Adding: ${order.weight_kg}kg, New total: ${newWeight}kg`);
       
-      // Close label if near threshold (95% of 3500kg = 3325kg)
-      if (existingLabel.cumulative_weight_kg >= 3325) {
-        existingLabel.status = 'CLOSED';
+      if (newWeight <= 5000) {
+        console.log(`✅ Adding to existing label ${existingLabel.label_id}`);
+        // Add to existing label
+        existingLabel.orders.push({
+          order_id: order.order_id,
+          weight_kg: order.weight_kg
+        });
+        existingLabel.cumulative_weight_kg = Math.round(newWeight * 100) / 100;
+        existingLabel.order_count++;
+        existingLabel.updated_at = new Date().toISOString();
+        
+        // Close label if near threshold (95% of 5000kg = 4750kg)
+        if (existingLabel.cumulative_weight_kg >= 4750) {
+          existingLabel.status = 'closed';
+          console.log(`🔒 Closing label ${existingLabel.label_id} - reached 95% threshold`);
+        }
+        
+        return existingLabel;
+      } else {
+        console.log(`⚠️  Cannot add to ${existingLabel.label_id} - would exceed 5000kg (${newWeight}kg)`);
       }
-      
-      return existingLabel;
+    } else {
+      console.log(`📝 No active label found for route ${route}`);
     }
   } catch (error) {
-    // No existing label found, will create new one
+    console.error(`❌ Error finding label:`, error.message);
   }
   
   // Create new label
   const nextNumber = await getNextLabelNumber(token);
   const labelId = `DHL-${String(nextNumber).padStart(4, '0')}`;
+  console.log(`🆕 Creating new label: ${labelId} for route ${route}`);
   
   return {
     _id: labelId,
@@ -360,7 +374,7 @@ async function getOrCreateLabel(order, token) {
     }],
     cumulative_weight_kg: order.weight_kg,
     order_count: 1,
-    status: 'ACTIVE',
+    status: 'active',
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString()
   };
@@ -581,6 +595,125 @@ app.get('/api/orders/pending', async (req, res) => {
   }
 });
 
+// Consolidate existing labels endpoint
+app.post('/consolidate-labels', async (req, res) => {
+  console.log('\n' + '='.repeat(60));
+  console.log('🔄 Manual label consolidation triggered');
+  console.log('='.repeat(60));
+  
+  try {
+    const token = await getIAMToken();
+    
+    // Get all labels
+    const labelsResponse = await axios.get(
+      `${CLOUDANT_URL}/labels/_all_docs?include_docs=true`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      }
+    );
+    
+    const labels = labelsResponse.data.rows
+      .map(row => row.doc)
+      .filter(doc => doc.label_id && !doc._id.startsWith('_design'));
+    
+    console.log(`📦 Found ${labels.length} labels`);
+    
+    // Group by route
+    const routeGroups = {};
+    labels.forEach(label => {
+      const route = label.route || `${label.source}_${label.destination}`;
+      if (!routeGroups[route]) {
+        routeGroups[route] = [];
+      }
+      routeGroups[route].push(label);
+    });
+    
+    const consolidationResults = [];
+    
+    for (const [route, routeLabels] of Object.entries(routeGroups)) {
+      if (routeLabels.length <= 1) continue;
+      
+      // Sort by created_at
+      routeLabels.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+      
+      const primaryLabel = routeLabels[0];
+      const labelsToMerge = routeLabels.slice(1);
+      
+      let totalWeight = primaryLabel.cumulative_weight_kg;
+      let allOrders = [...primaryLabel.orders];
+      
+      console.log(`\n📍 Route: ${route}`);
+      console.log(`   Primary: ${primaryLabel.label_id} (${primaryLabel.cumulative_weight_kg}kg)`);
+      
+      for (const label of labelsToMerge) {
+        console.log(`   Merging: ${label.label_id} (${label.cumulative_weight_kg}kg)`);
+        totalWeight += label.cumulative_weight_kg;
+        allOrders = allOrders.concat(label.orders);
+        
+        // Delete merged label
+        await axios.delete(
+          `${CLOUDANT_URL}/labels/${label._id}?rev=${label._rev}`,
+          {
+            headers: {
+              'Authorization': `Bearer ${token}`
+            }
+          }
+        );
+      }
+      
+      // Update primary label
+      primaryLabel.orders = allOrders;
+      primaryLabel.cumulative_weight_kg = Math.round(totalWeight * 100) / 100;
+      primaryLabel.order_count = allOrders.length;
+      primaryLabel.max_weight_kg = 5000;
+      primaryLabel.route = route;
+      primaryLabel.updated_at = new Date().toISOString();
+      primaryLabel.status = totalWeight >= 4750 ? 'closed' : 'active';
+      
+      await axios.put(
+        `${CLOUDANT_URL}/labels/${primaryLabel._id}`,
+        primaryLabel,
+        {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      
+      consolidationResults.push({
+        route,
+        primary_label: primaryLabel.label_id,
+        merged_count: labelsToMerge.length,
+        total_weight: totalWeight,
+        total_orders: allOrders.length,
+        status: primaryLabel.status
+      });
+      
+      console.log(`   ✅ Consolidated into ${primaryLabel.label_id}: ${totalWeight}kg, ${allOrders.length} orders`);
+    }
+    
+    console.log('='.repeat(60) + '\n');
+    
+    res.json({
+      success: true,
+      message: 'Label consolidation complete',
+      consolidated_routes: consolidationResults.length,
+      results: consolidationResults
+    });
+    
+  } catch (error) {
+    console.error('❌ Error:', error.message);
+    console.log('='.repeat(60) + '\n');
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({
@@ -588,7 +721,8 @@ app.get('/', (req, res) => {
     version: '2.0.0',
     endpoints: {
       webhook: 'POST /webhook - Receive OTM orders',
-      process: 'POST /process-orders - Process orders with 3500kg logic (Watson AI)',
+      process: 'POST /process-orders - Process orders with 5000kg logic (Watson AI)',
+      consolidate: 'POST /consolidate-labels - Consolidate existing labels by route',
       labels: 'GET /api/labels - Get all labels (Dashboard API)',
       label: 'GET /api/label/:id - Get specific label (Dashboard API)',
       pending: 'GET /api/orders/pending - Get pending orders count',
@@ -611,3 +745,4 @@ app.listen(PORT, () => {
   console.log('  GET  /        - Service info');
   console.log('='.repeat(60) + '\n');
 });
+
